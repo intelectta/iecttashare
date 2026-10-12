@@ -1,0 +1,125 @@
+name: Build APK (zip2apk)
+run-name: build ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Unique build tag (set by the GUI)
+        required: true
+      asset:
+        description: Staging release asset holding the source zip
+        required: true
+      build_type:
+        description: debug or release
+        default: debug
+      java_version:
+        description: JDK version
+        default: '17'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      BUILD_TYPE: ${{ inputs.build_type }}
+      ASSET: ${{ inputs.asset }}
+    steps:
+      - name: Download source zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download zip2apk-staging -R "$GITHUB_REPOSITORY" -p "$ASSET" --output src.zip
+          mkdir src
+          unzip -q src.zip -d src
+          rm -rf src/__MACOSX
+
+      - name: Detect project type
+        run: |
+          cand=$(find src -maxdepth 4 \( -name gradlew -o -name settings.gradle -o -name settings.gradle.kts -o -name pubspec.yaml -o -name buildozer.spec \) -not -path '*/node_modules/*' \
+                 | awk -F/ '{print NF" "$0}' | sort -n | head -1 | cut -d' ' -f2-)
+          if [ -z "$cand" ]; then
+            echo "::error::No gradlew / settings.gradle / pubspec.yaml / buildozer.spec found in the zip"
+            exit 1
+          fi
+          dir=$(dirname "$cand")
+          case "$(basename "$cand")" in
+            pubspec.yaml)   kind=flutter ;;
+            buildozer.spec) kind=kivy ;;
+            *)              kind=gradle ;;
+          esac
+          echo "PROJ_DIR=$GITHUB_WORKSPACE/$dir" >> "$GITHUB_ENV"
+          echo "KIND=$kind" >> "$GITHUB_ENV"
+          echo "Detected $kind project in $dir"
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+
+      - name: Setup Gradle
+        if: env.KIND == 'gradle'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: current
+
+      - name: Build (Gradle)
+        if: env.KIND == 'gradle'
+        working-directory: ${{ env.PROJ_DIR }}
+        run: |
+          task=assembleDebug
+          [ "$BUILD_TYPE" = release ] && task=assembleRelease
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            ./gradlew "$task" --stacktrace --no-daemon
+          else
+            gradle "$task" --stacktrace --no-daemon
+          fi
+
+      - name: Setup Flutter
+        if: env.KIND == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build (Flutter)
+        if: env.KIND == 'flutter'
+        working-directory: ${{ env.PROJ_DIR }}
+        run: |
+          flutter pub get
+          flutter build apk --"$BUILD_TYPE"
+
+      - name: Setup Python
+        if: env.KIND == 'kivy'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build (Buildozer)
+        if: env.KIND == 'kivy'
+        working-directory: ${{ env.PROJ_DIR }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip autoconf automake libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
+          pip install --upgrade pip buildozer cython
+          yes | buildozer -v android "$BUILD_TYPE"
+
+      - name: Collect APKs
+        run: |
+          mkdir -p out
+          find "$PROJ_DIR" \( -name '*.apk' -o -name '*.aab' \) -not -path '*/intermediates/*' -not -path '*/.buildozer/*' -exec cp -f {} out/ \;
+          ls -la out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
